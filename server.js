@@ -4,90 +4,147 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 
 const app = express();
-const PORT = 3000;
+const PORT = 3001;
 
-// Middleware
-app.use(cors()); // Permite que la App React se conecte
+app.use(cors());
 app.use(bodyParser.json());
 
-// --- BASE DE DATOS SQLITE ---
+// --- BASE DE DATOS ---
 const db = new sqlite3.Database('./database.sqlite', (err) => {
-  if (err) console.error('Error al abrir la BD', err);
+  if (err) console.error(err);
   else {
-    console.log('Conectado a la base de datos SQLite.');
+    console.log('✅ DB Conectada. Sistema listo.');
     crearTablas();
   }
 });
 
 function crearTablas() {
-  // 1. Tabla de USUARIOS
+  // Tabla Usuarios
   db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    username TEXT UNIQUE, 
+    password TEXT, 
     role TEXT
-  )`, () => {
-    // Insertar usuario Admin por defecto si no existe
-    db.run(`INSERT OR IGNORE INTO users (username, password, role) VALUES ('admin', 'admin123', 'admin')`);
-  });
+  )`);
+  // Admin por defecto
+  db.run(`INSERT OR IGNORE INTO users (username, password, role) VALUES ('admin', 'admin123', 'admin')`);
 
-  // 2. Tabla de DISPOSITIVOS (Tus Arduinos)
+  // Tabla Dispositivos (Con nombres de botones individuales)
   db.run(`CREATE TABLE IF NOT EXISTS devices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    ip TEXT,
-    location TEXT,
-    type TEXT
+    name TEXT, ip TEXT, location TEXT, type TEXT, status TEXT DEFAULT '0', 
+    d4_name TEXT DEFAULT 'Luz', d5_name TEXT DEFAULT 'Ventilador', 
+    d6_name TEXT DEFAULT 'Patio', d7_name TEXT DEFAULT 'Auxiliar',
+    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  
+  // Tabla Historial
+  db.run(`CREATE TABLE IF NOT EXISTS action_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    user_id INTEGER, action TEXT, target_type TEXT, target_id INTEGER, 
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 }
 
-// --- RUTAS DE LA API (ENDPOINTS) ---
+// --- MIDDLEWARE DE ROLES ---
+const checkAdmin = (req, res, next) => {
+    const userId = req.headers['x-user-id'];
+    if (!userId) return next(); 
+    db.get("SELECT role FROM users WHERE id = ?", [userId], (err, row) => {
+        if(row && row.role === 'admin') req.isAdmin = true;
+        else req.isAdmin = false;
+        next();
+    });
+};
+app.use(checkAdmin);
 
-// 1. LOGIN (Verificar usuario)
+// --- RUTAS AUTH ---
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
-  
   db.get("SELECT * FROM users WHERE username = ? AND password = ?", [username, password], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (row) {
-      res.json({ success: true, user: { id: row.id, name: row.username, role: row.role } });
-    } else {
-      res.status(401).json({ success: false, message: "Credenciales incorrectas" });
-    }
+    if (row) res.json({ success: true, user: { id: row.id, name: row.username, role: row.role } });
+    else res.status(401).json({ success: false, message: "Credenciales incorrectas" });
   });
 });
 
-// 2. OBTENER DISPOSITIVOS (Para mostrar en el Dashboard)
+// --- RUTAS DISPOSITIVOS ---
 app.get('/api/devices', (req, res) => {
-  db.all("SELECT * FROM devices", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  db.all("SELECT * FROM devices", [], (err, rows) => res.json(rows));
 });
 
-// 3. AGREGAR NUEVO DISPOSITIVO (Configuración)
 app.post('/api/devices', (req, res) => {
-  const { name, ip, location, type } = req.body;
-  db.run("INSERT INTO devices (name, ip, location, type) VALUES (?, ?, ?, ?)", 
-    [name, ip, location, type], 
-    function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID, message: "Dispositivo agregado" });
-    }
+  if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+  const { name, ip, location, d4_name, d5_name, d6_name, d7_name } = req.body;
+  db.run("INSERT INTO devices (name, ip, location, d4_name, d5_name, d6_name, d7_name, status) VALUES (?,?,?,?,?,?,?, '0')", 
+      [name, ip, location, d4_name, d5_name, d6_name, d7_name], 
+      function(err) { res.json({ id: this.lastID }); }
   );
 });
 
-// 4. ELIMINAR DISPOSITIVO
-app.delete('/api/devices/:id', (req, res) => {
-  const id = req.params.id;
-  db.run("DELETE FROM devices WHERE id = ?", id, function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Dispositivo eliminado" });
-  });
+app.put('/api/devices/:id', (req, res) => {
+    if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+    const { name, ip, location, d4_name, d5_name, d6_name, d7_name } = req.body;
+    db.run("UPDATE devices SET name=?, ip=?, location=?, d4_name=?, d5_name=?, d6_name=?, d7_name=? WHERE id=?", 
+      [name, ip, location, d4_name, d5_name, d6_name, d7_name, req.params.id], 
+      () => res.json({message:"Actualizado"})
+    );
 });
 
-// Iniciar Servidor
-app.listen(PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${PORT}`);
-  console.log(`Usuario por defecto: admin / admin123`);
+app.delete('/api/devices/:id', (req, res) => {
+    if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+    db.run("DELETE FROM devices WHERE id = ?", [req.params.id], () => res.json({message:"Borrado"}));
 });
+
+app.put('/api/devices/:id/status', (req, res) => {
+    const { status } = req.body;
+    db.run("UPDATE devices SET status = ? WHERE id = ?", [status, req.params.id], () => res.json({msg:"Ok"}));
+});
+
+// --- RUTAS USUARIOS ---
+app.get('/api/users', (req, res) => {
+    if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+    db.all("SELECT id, username, role FROM users", [], (err, rows) => res.json(rows));
+});
+
+app.post('/api/users', (req, res) => {
+    if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+    const { username, password, role } = req.body;
+    db.run("INSERT INTO users (username, password, role) VALUES (?,?,?)", [username, password, role], 
+        (err) => err ? res.status(500).json({error:"Error"}) : res.json({message:"Creado"})
+    );
+});
+
+app.put('/api/users/:id', (req, res) => {
+    const targetId = parseInt(req.params.id);
+    const requesterId = parseInt(req.headers['x-user-id']);
+    // Permiso: Admin o el mismo usuario
+    if(!req.isAdmin && targetId !== requesterId) return res.status(403).json({error:"Prohibido"});
+
+    const { username, password, role } = req.body;
+    let sql = "UPDATE users SET ";
+    let params = [];
+
+    if(req.isAdmin && username) { sql += "username=?, "; params.push(username); }
+    if(req.isAdmin && role) { sql += "role=?, "; params.push(role); }
+    if(password && password.length > 0) { sql += "password=?, "; params.push(password); }
+
+    if (params.length === 0) return res.json({msg: "Nada que actualizar"});
+    
+    sql = sql.slice(0, -2) + " WHERE id=?";
+    params.push(targetId);
+
+    db.run(sql, params, (err) => err ? res.status(500).json({error:err.message}) : res.json({message:"Actualizado"}));
+});
+
+app.delete('/api/users/:id', (req, res) => {
+    if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+    db.run("DELETE FROM users WHERE id=?", [req.params.id], () => res.json({message:"Borrado"}));
+});
+
+// Historial
+app.get('/api/history', (req, res) => {
+    if(!req.isAdmin) return res.status(403).json({error:"Requiere Admin"});
+    db.all("SELECT * FROM action_history ORDER BY timestamp DESC LIMIT 50", [], (err, rows) => res.json(rows));
+});
+
+app.listen(PORT, () => console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`));
